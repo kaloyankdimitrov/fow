@@ -1,80 +1,26 @@
 import socket
-import struct
 import time
-import collections
 import threading
 import queue
-import random
+import zlib
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from transformers import VideoMAEImageProcessor, VideoMAEForPreTraining
+from transformers import VideoMAEForPreTraining
+from mae_protocol import (HEADER as PACKET_HEADER, IMG_SIZE, MASK_RATIO,
+                          N_MASKED, PATCH_DIM, decode_clip, patchify, unpatchify)
 
 # ─── Configuration ────────────────────────────────────────────────────────
 UDP_IP = "0.0.0.0" # Listen on all interfaces
 UDP_PORT = 5005
+FRAME_TIMEOUT = 3.0
+MAX_PENDING_FRAMES = 32
 
 # VideoMAE Constants
 MODEL_ID      = "MCG-NJU/videomae-base"
-NUM_FRAMES    = 16
-TUBELET_SIZE  = 2
-IMG_SIZE      = 224
-PATCH_SIZE    = 16
-GRID          = IMG_SIZE // PATCH_SIZE
-T_TOKENS      = NUM_FRAMES // TUBELET_SIZE
-N_TOKENS      = T_TOKENS * GRID * GRID
-MASK_RATIO    = 0.75
-N_MASKED      = int(N_TOKENS * MASK_RATIO)
-N_VISIBLE     = N_TOKENS - N_MASKED
-PATCH_DIM     = PATCH_SIZE * PATCH_SIZE * TUBELET_SIZE * 3
-
 IN_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IN_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-GREY_FILL = 128
-
-# ─── VideoMAE Helpers (From previous script) ──────────────────────────────
-
-def tensor_to_uint8(t: torch.Tensor) -> np.ndarray:
-    mean = torch.tensor(IN_MEAN, device=t.device).view(3,1,1)
-    std  = torch.tensor(IN_STD,  device=t.device).view(3,1,1)
-    img  = (t * std + mean).clamp(0, 1).permute(1, 2, 0)
-    return (img.cpu().numpy() * 255).astype(np.uint8)
-
-def make_noise_mask(seed: int | None = None) -> torch.Tensor:
-    rng = random.Random(seed)
-    order = list(range(N_TOKENS))
-    rng.shuffle(order)
-    noise = torch.zeros(1, N_TOKENS)
-    for idx in order[:N_MASKED]:
-        noise[0, idx] = 1.0
-    return noise
-
-def patchify_video(pixel_values: torch.Tensor) -> torch.Tensor:
-    B, C, T, H, W = pixel_values.shape
-    p, ts = PATCH_SIZE, TUBELET_SIZE
-    gt, gh, gw = T // ts, H // p, W // p
-    x = pixel_values.reshape(B, C, gt, ts, gh, p, gw, p)
-    x = x.permute(0, 2, 4, 6, 3, 5, 7, 1)
-    return x.reshape(B, gt * gh * gw, ts * p * p * C)
-
-def unpatchify_video(patches: torch.Tensor) -> torch.Tensor:
-    B, N, D = patches.shape
-    p, ts, gt, gh, gw, C = PATCH_SIZE, TUBELET_SIZE, T_TOKENS, GRID, GRID, 3
-    x = patches.reshape(B, gt, gh, gw, ts, p, p, C)
-    x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)
-    return x.reshape(B, C, gt * ts, gh * p, gw * p)
-
-def _apply_spatial_mask(img: np.ndarray, spatial_mask: np.ndarray) -> np.ndarray:
-    out = img.copy()
-    for idx in range(GRID * GRID):
-        if spatial_mask[idx]:
-            row, col = divmod(idx, GRID)
-            r0, r1 = row * PATCH_SIZE, (row + 1) * PATCH_SIZE
-            c0, c1 = col * PATCH_SIZE, (col + 1) * PATCH_SIZE
-            out[r0:r1, c0:c1] = GREY_FILL
-    return out
 
 # ─── Model Wrapper ────────────────────────────────────────────────────────
 
@@ -82,54 +28,26 @@ class VideoMAEReconstructor:
     def __init__(self, device: str):
         self.device = device
         print(f"[VideoMAE] Loading model on {device}...")
-        self.processor = VideoMAEImageProcessor.from_pretrained(MODEL_ID)
         self.model = VideoMAEForPreTraining.from_pretrained(MODEL_ID).eval().to(device)
         print("[VideoMAE] Ready.")
 
     @torch.no_grad()
-    def reconstruct(self, frames_rgb: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        pil_list = [Image.fromarray(f) for f in frames_rgb]
-        inputs = self.processor(pil_list, return_tensors="pt")
-        pv = inputs["pixel_values"].to(self.device)
-        pv_BCTHW = pv.permute(0, 2, 1, 3, 4)
-
-        noise = make_noise_mask().to(self.device)
-        bool_masked = (noise > 0.5).to(self.device)
-
-        outputs = self.model(pixel_values=pv, bool_masked_pos=bool_masked)
-        logits = outputs.logits
-
-        # Apply per-channel un-normalization fix
-        all_patches = patchify_video(pv_BCTHW)
-        patches_c = all_patches.view(1, all_patches.shape[1], -1, 3)
-        
-        patch_mean = patches_c.mean(dim=2, keepdim=True)
-        patch_var  = patches_c.var(dim=2, keepdim=True, unbiased=False)
-        patch_std  = (patch_var + 1e-6).sqrt()
-
-        logits_c = logits.view(1, logits.shape[1], -1, 3)
-        masked_indices = bool_masked.nonzero(as_tuple=True)[0]
-        
-        pred_unnorm_c = logits_c * patch_std[:, masked_indices, :, :] + patch_mean[:, masked_indices, :, :]
-        pred_unnorm = pred_unnorm_c.view(1, -1, PATCH_DIM)
-
-        composite = all_patches[0].clone()
-        composite[bool_masked] = pred_unnorm[0]
-        clip_recon = unpatchify_video(composite.unsqueeze(0))
-
-        last_orig  = pv_BCTHW[0, :, -1, :, :]
-        last_recon = clip_recon[0, :, -1, :, :]
-
-        orig_uint8  = tensor_to_uint8(last_orig)
-        recon_uint8 = tensor_to_uint8(last_recon)
-
-        t_idx = T_TOKENS - 1
-        start = t_idx * GRID * GRID
-        end   = start + GRID * GRID
-        spatial_mask = bool_masked[start:end].cpu().numpy()
-
-        masked_uint8 = _apply_spatial_mask(orig_uint8, spatial_mask)
-        return orig_uint8, masked_uint8, recon_uint8
+    def reconstruct(self, clip) -> tuple[np.ndarray, np.ndarray]:
+        frames, mask, stats = clip
+        # The wire carries only visible pixels. Normalize them for the encoder;
+        # masked tubelets are excluded by bool_masked_pos inside VideoMAE.
+        rgb = frames.astype(np.float32) / 255
+        normalized = (rgb - IN_MEAN) / IN_STD
+        pv = torch.from_numpy(normalized).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
+        bool_masked = torch.from_numpy(mask).unsqueeze(0).to(self.device)
+        logits = self.model(pixel_values=pv, bool_masked_pos=bool_masked).logits
+        predictions = logits[0].cpu().numpy().reshape(N_MASKED, -1, 3)
+        if self.model.config.norm_pix_loss:
+            predictions = predictions * stats[:, 1, None, :] + stats[:, 0, None, :]
+        patches = patchify(rgb).copy()
+        patches[mask] = predictions.reshape(N_MASKED, PATCH_DIM)
+        reconstructed = (unpatchify(patches).clip(0, 1) * 255).astype(np.uint8)
+        return frames[-1], reconstructed[-1]
 
 class InferenceWorker(threading.Thread):
     def __init__(self, reconstructor: VideoMAEReconstructor):
@@ -138,7 +56,7 @@ class InferenceWorker(threading.Thread):
         self.in_q = queue.Queue(maxsize=2)
         self.out_q = queue.Queue(maxsize=1)
 
-    def push(self, frames: list[np.ndarray]):
+    def push(self, frames):
         try:
             self.in_q.put_nowait(frames)
         except queue.Full:
@@ -171,88 +89,155 @@ def draw_label(img, text, color=(255, 255, 255)):
 
 # ─── Main UDP Receiver Loop ───────────────────────────────────────────────
 
+class FrameAssembler:
+    """Reassemble sender_mae's masked clip chunks, bounding incomplete frame storage."""
+
+    def __init__(self):
+        self.pending = {}
+
+    def expire(self):
+        cutoff = time.monotonic() - FRAME_TIMEOUT
+        for key, (created, _, _) in list(self.pending.items()):
+            if created < cutoff:
+                del self.pending[key]
+
+    def add(self, packet, addr):
+        self.expire()
+        if len(packet) <= PACKET_HEADER.size:
+            return None
+        frame_id, total_chunks, chunk_idx = PACKET_HEADER.unpack_from(packet)
+        if total_chunks == 0 or chunk_idx >= total_chunks:
+            return None
+
+        key = (addr, frame_id)
+        if key not in self.pending:
+            if len(self.pending) >= MAX_PENDING_FRAMES:
+                del self.pending[next(iter(self.pending))]
+            self.pending[key] = (time.monotonic(), total_chunks, {})
+        _, expected, chunks = self.pending[key]
+        if total_chunks != expected:
+            return None
+        chunks[chunk_idx] = packet[PACKET_HEADER.size:]
+        if len(chunks) == expected:
+            del self.pending[key]
+            return b''.join(chunks[i] for i in range(expected))
+        return None
+
+class UDPWorker(threading.Thread):
+    """Drain UDP independently of GUI event processing and model inference."""
+
+    def __init__(self, sock):
+        super().__init__(daemon=True)
+        self.sock = sock
+        self.clips = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.packets = 0
+        self.completed = 0
+        self.errors = 0
+        self.assembler = FrameAssembler()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                packet, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                self.assembler.expire()
+                continue
+            except OSError:
+                if self.stop_event.is_set():
+                    break
+                raise
+            self.packets += 1
+            data = self.assembler.add(packet, addr)
+            if data is None:
+                continue
+            try:
+                clip = decode_clip(data)
+            except (ValueError, zlib.error) as exc:
+                self.errors += 1
+                print(f"[Packet Error] {exc}")
+                continue
+            self.completed += 1
+            try:
+                self.clips.get_nowait()
+            except queue.Empty:
+                pass
+            self.clips.put_nowait(clip)
+
+    def latest(self):
+        try:
+            return self.clips.get_nowait()
+        except queue.Empty:
+            return None
+
+    def status(self):
+        return f"Packets: {self.packets}  Clips: {self.completed}  Errors: {self.errors}"
+
+
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    reconstructor = VideoMAEReconstructor(device)
-    worker = InferenceWorker(reconstructor)
-    worker.start()
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Some operating systems cap receive buffers below this requested size.
+    # A dedicated reader is necessary even with a large buffer.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     sock.bind((UDP_IP, UDP_PORT))
-    sock.settimeout(0.01) # Non-blocking so cv2.imshow can update
-
+    sock.settimeout(0.1)
+    network = UDPWorker(sock)
+    network.start()
     print(f"[Receiver] Listening on {UDP_IP}:{UDP_PORT} ...")
 
-    frame_buffer = collections.deque(maxlen=NUM_FRAMES)
-    assembler = {} # dict to hold chunk data: frame_id -> {chunk_idx: data}
-    
-    last_result = None
     WIN = "VideoMAE UDP Receiver"
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN, IMG_SIZE * 3 + 8, IMG_SIZE)
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        reconstructor = VideoMAEReconstructor(device)
+        worker = InferenceWorker(reconstructor)
+        worker.start()
+        last_result = None
+        masked_input = None
+        last_status = time.monotonic()
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN, IMG_SIZE * 2 + 4, IMG_SIZE)
 
-    while True:
-        try:
-            packet, addr = sock.recvfrom(65535)
-            
-            # Unpack 8-byte header
-            header = packet[:8]
-            chunk_data = packet[8:]
-            frame_id, total_chunks, chunk_idx = struct.unpack('<IHH', header)
-            
-            if frame_id not in assembler:
-                assembler[frame_id] = {}
-            assembler[frame_id][chunk_idx] = chunk_data
-            
-            # Check if frame is fully assembled
-            if len(assembler[frame_id]) == total_chunks:
-                # Reassemble in order
-                full_data = b''.join([assembler[frame_id][i] for i in range(total_chunks)])
-                del assembler[frame_id] # Cleanup
-                
-                # Cleanup old partial frames to prevent memory leaks
-                old_keys = [k for k in assembler.keys() if k < frame_id - 5]
-                for k in old_keys: del assembler[k]
+        while network.is_alive():
+            clip = network.latest()
+            if clip is not None:
+                masked_input = clip[0][-1]
+                worker.push(clip)
+            result = worker.latest()
+            if result is not None:
+                last_result = result
 
-                # Decode JPEG
-                np_arr = np.frombuffer(full_data, np.uint8)
-                bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                
-                if bgr is not None:
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    frame_buffer.append(rgb)
-                    
-                    if len(frame_buffer) == NUM_FRAMES:
-                        worker.push(list(frame_buffer))
-
-        except socket.timeout:
-            pass # Expected, just update the GUI
-            
-        result = worker.latest()
-        if result is not None:
-            last_result = result
-
-        if last_result is not None:
-            original, masked, recon = last_result
-            
-            orig_bgr = draw_label(cv2.cvtColor(original, cv2.COLOR_RGB2BGR), "UDP Input", (180, 255, 180))
-            mask_bgr = draw_label(cv2.cvtColor(masked, cv2.COLOR_RGB2BGR), f"Masked ({MASK_RATIO*100}%)", (100, 100, 255))
-            rec_bgr  = draw_label(cv2.cvtColor(recon, cv2.COLOR_RGB2BGR), "Reconstruction", (80, 200, 255))
-            
-            divider = np.full((IMG_SIZE, 4, 3), 60, dtype=np.uint8)
-            panel = np.concatenate([orig_bgr, divider, mask_bgr, divider, rec_bgr], axis=1)
+            if last_result is not None or masked_input is not None:
+                if last_result is not None:
+                    masked, recon = last_result
+                    rec_label = "Reconstruction"
+                else:
+                    masked = masked_input
+                    recon = np.full_like(masked, 40)
+                    rec_label = "Reconstructing..."
+                mask_bgr = draw_label(cv2.cvtColor(masked, cv2.COLOR_RGB2BGR),
+                                      f"Sender masked ({MASK_RATIO*100}%)", (100, 100, 255))
+                rec_bgr = draw_label(cv2.cvtColor(recon, cv2.COLOR_RGB2BGR),
+                                     rec_label, (80, 200, 255))
+                divider = np.full((IMG_SIZE, 4, 3), 60, dtype=np.uint8)
+                panel = np.concatenate([mask_bgr, divider, rec_bgr], axis=1)
+            else:
+                panel = np.full((IMG_SIZE, IMG_SIZE * 2 + 4, 3), 40, dtype=np.uint8)
+                cv2.putText(panel, "Waiting for masked UDP clip...", (10, 90),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+            cv2.putText(panel, network.status(), (4, IMG_SIZE - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
             cv2.imshow(WIN, panel)
-        else:
-            panel = np.full((IMG_SIZE, IMG_SIZE * 3 + 8, 3), 40, dtype=np.uint8)
-            cv2.putText(panel, f"Waiting for UDP stream... Buffered: {len(frame_buffer)}/{NUM_FRAMES}", 
-                        (20, IMG_SIZE // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
-            cv2.imshow(WIN, panel)
+            if time.monotonic() - last_status >= 5:
+                print(f"[Receiver] {network.status()}")
+                last_status = time.monotonic()
+            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+                break
+    finally:
+        network.stop_event.set()
+        network.join(timeout=1)
+        sock.close()
+        cv2.destroyAllWindows()
 
-        if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
-            break
-
-    sock.close()
-    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
