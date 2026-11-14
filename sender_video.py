@@ -1,3 +1,7 @@
+from video_source import open_source, parse_source_args
+
+args = parse_source_args()
+
 import cv2
 import numpy as np
 import socket
@@ -10,7 +14,7 @@ GRID_SIZE = 14
 MASK_RATIO = 0.25  # Hide 75% of the frame data
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-cap = cv2.VideoCapture(1 if cv2.VideoCapture(1).isOpened() else 0)
+cap = open_source(args, fallback_camera=True)
 
 print(f"Streaming compressed sparse video to {UDP_IP}:{UDP_PORT}...")
 

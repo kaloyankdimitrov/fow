@@ -1,3 +1,7 @@
+from video_source import open_source, parse_source_args
+
+args = parse_source_args()
+
 import cv2
 import numpy as np
 import socket
@@ -11,7 +15,7 @@ MASK_RATIO = 0.75  # Correctly configured: Hides 75% of the frame data
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 # Fixed: Instantiated cleanly once to maximize frame rate
-cap = cv2.VideoCapture(1)
+cap = open_source(args)
 
 print(f"Streaming high-performance sparse video to {UDP_IP}:{UDP_PORT}...")
 

@@ -1,3 +1,7 @@
+from video_source import open_source, parse_source_args
+
+args = parse_source_args()
+
 import cv2
 import numpy as np
 import socket
@@ -13,18 +17,7 @@ MASK_RATIO = 0.75
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
-# --- MAC CAMERA FIX ---
-# On macOS, index 0 can automatically route to Continuity Camera (iPhone).
-# Index 1 or higher typically forces the internal FaceTime HD Camera.
-cap = cv2.VideoCapture(1) 
-
-# If index 1 fails to open, fallback to index 0 safely
-if not cap.isOpened():
-    print("Camera index 1 not found. Falling back to default camera index 0...")
-    cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    raise RuntimeError("Could not open any local webcam device.")
+cap = open_source(args, fallback_camera=True)
 
 print(f"Sending optimized video patches to {UDP_IP}:{UDP_PORT}...")
 

@@ -1,3 +1,7 @@
+from video_source import open_source, parse_source_args
+
+args = parse_source_args()
+
 import cv2
 import numpy as np
 import socket
@@ -22,7 +26,7 @@ KEYFRAME_CHUNK_SIZE = 1000
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-cap = cv2.VideoCapture(1)
+cap = open_source(args)
 
 frame_id = 0
 

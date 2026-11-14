@@ -1,4 +1,5 @@
 import cv2
+from video_source import open_source, parse_source_args
 import socket
 import time
 from mae_protocol import NUM_FRAMES, encode_clip, packetize
@@ -10,12 +11,11 @@ MAX_PAYLOAD = 1400    # Safe size below standard 1500 MTU
 IMG_SIZE = 224
 
 def main():
+    args = parse_source_args()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    cap = cv2.VideoCapture(1)
-    
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open camera.")
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap = open_source(args)
+    if args.input is None:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     print(f"[Sender] Streaming to {UDP_IP}:{UDP_PORT} ... Press Ctrl+C to stop.")
     
@@ -26,6 +26,8 @@ def main():
         while True:
             ret, bgr = cap.read()
             if not ret:
+                if args.input is not None:
+                    break
                 time.sleep(0.01)
                 continue
                 

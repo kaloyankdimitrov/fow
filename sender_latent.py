@@ -1,3 +1,7 @@
+from video_source import open_source, parse_source_args
+
+args = parse_source_args()
+
 import cv2
 import torch
 import socket
@@ -22,8 +26,8 @@ model.eval()
 # Socket Setup
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# OpenCV Video Capture (Source 1 as specified)
-cap = cv2.VideoCapture(1)
+# Open the selected webcam or video file
+cap = open_source(args)
 
 print("Sender online. Streaming compressed latents...")
 
